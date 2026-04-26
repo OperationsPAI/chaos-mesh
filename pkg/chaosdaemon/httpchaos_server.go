@@ -70,12 +70,35 @@ func (t *stdioTransport) RoundTrip(req *http.Request) (resp *http.Response, err 
 	return
 }
 
+// httpChaosIdentifier returns the BPM identifier under which the tproxy
+// process for a given container is registered. Keeping it as a single helper
+// lets ApplyHttpChaos and createHttpChaos agree on the exact key to look up.
+func httpChaosIdentifier(containerID string) string {
+	return fmt.Sprintf("tproxy-%s", containerID)
+}
+
 func (s *DaemonServer) ApplyHttpChaos(ctx context.Context, in *pb.ApplyHttpChaosRequest) (*pb.ApplyHttpChaosResponse, error) {
 	log := s.getLoggerFromContext(ctx)
 	log.Info("applying http chaos")
 
 	if in.InstanceUid == "" {
 		if uid, ok := s.backgroundProcessManager.GetUID(bpm.ProcessPair{Pid: int(in.Instance), CreateTime: in.StartTime}); ok {
+			in.InstanceUid = uid
+		}
+	}
+
+	// Idempotency: if the controller / RPC retries (which it routinely does
+	// while the PodHttpChaos status update lands), the InstanceUid the caller
+	// sends is empty and the (Pid, StartTime) reverse lookup misses for any of
+	// the usual reasons (zero-valued status fields, daemon-side restart, race
+	// with the controller's deferred status update). Without recovery, the next
+	// createHttpChaos call would fail with "process with identifier
+	// tproxy-<containerId> is running" and HTTPChaos would be stuck at
+	// injectedCount=0 forever even though tproxy is healthy inside the pod.
+	// Look up the live tproxy process directly by its identifier and reuse it.
+	if in.InstanceUid == "" && in.ContainerId != "" {
+		if uid, ok := s.backgroundProcessManager.GetUidByIdentifier(httpChaosIdentifier(in.ContainerId)); ok {
+			log.Info("recovered existing tproxy", "uid", uid, "containerId", in.ContainerId)
 			in.InstanceUid = uid
 		}
 	}
@@ -180,7 +203,7 @@ func (s *DaemonServer) createHttpChaos(ctx context.Context, in *pb.ApplyHttpChao
 	}
 	processBuilder := bpm.DefaultProcessBuilder(tproxyBin, "-i", "-vv").
 		EnableLocalMnt().
-		SetIdentifier(fmt.Sprintf("tproxy-%s", in.ContainerId)).
+		SetIdentifier(httpChaosIdentifier(in.ContainerId)).
 		SetEnv(pathEnv, os.Getenv(pathEnv))
 
 	if in.EnterNS {

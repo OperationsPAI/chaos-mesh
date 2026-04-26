@@ -210,7 +210,11 @@ func (m *BackgroundProcessManager) recycle(uid string) {
 func (m *BackgroundProcessManager) StartProcess(ctx context.Context, cmd *ManagedCommand) (*Process, error) {
 	log := m.getLoggerFromContext(ctx)
 	if cmd.Identifier != nil {
-		_, loaded := m.identifiers.LoadOrStore(*cmd.Identifier, true)
+		// Reserve the identifier slot with a sentinel empty string so that any
+		// concurrent StartProcess call with the same identifier still bails out,
+		// but successful starts will overwrite the slot with the real UID below —
+		// enabling idempotent reuse via GetUidByIdentifier.
+		_, loaded := m.identifiers.LoadOrStore(*cmd.Identifier, "")
 		if loaded {
 			return nil, errors.Errorf("process with identifier %s is running", *cmd.Identifier)
 		}
@@ -218,11 +222,20 @@ func (m *BackgroundProcessManager) StartProcess(ctx context.Context, cmd *Manage
 
 	process, err := startProcess(cmd)
 	if err != nil {
+		// roll back the identifier reservation so the next call can retry
+		if cmd.Identifier != nil {
+			m.identifiers.Delete(*cmd.Identifier)
+		}
 		return nil, err
 	}
 
 	m.processes.Store(process.Uid, process)
 	m.pidPairToUid.Store(process.Pair, process.Uid)
+	if cmd.Identifier != nil {
+		// Now that we have a UID, replace the sentinel with the real UID so
+		// callers can recover the running process (and its pipes) on retry.
+		m.identifiers.Store(*cmd.Identifier, process.Uid)
+	}
 	// end
 
 	if m.metricsCollector != nil {
@@ -324,6 +337,30 @@ func (m *BackgroundProcessManager) GetIdentifiers() []string {
 	})
 
 	return identifiers
+}
+
+// GetUidByIdentifier returns the UID of the running process registered under
+// the given identifier. The second return value is false when no process with
+// that identifier is currently tracked, or when the slot is still in the
+// reserved-but-not-started state (sentinel empty string). This enables callers
+// such as ApplyHttpChaos to recover the existing process on retry instead of
+// failing with "process with identifier ... is running".
+func (m *BackgroundProcessManager) GetUidByIdentifier(identifier string) (string, bool) {
+	v, loaded := m.identifiers.Load(identifier)
+	if !loaded {
+		return "", false
+	}
+	uid, ok := v.(string)
+	if !ok || uid == "" {
+		return "", false
+	}
+	// Make sure the process is actually still tracked. The deathChannel goroutine
+	// deletes the identifier on process exit, but we double-check to guard
+	// against any caller having raced with recycle.
+	if _, ok := m.processes.Load(uid); !ok {
+		return "", false
+	}
+	return uid, true
 }
 
 func (m *BackgroundProcessManager) getLoggerFromContext(ctx context.Context) logr.Logger {

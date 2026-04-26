@@ -187,4 +187,78 @@ var _ = Describe("background process manager", func() {
 			WaitProcess(m, p, time.Second*0)
 		})
 	})
+
+	// Regression test for the HTTPChaos retry bug:
+	//
+	//   On a retried ApplyHttpChaos gRPC call, the daemon previously
+	//   re-invoked StartProcess with the same `tproxy-<containerId>`
+	//   identifier, was rejected with "process with identifier ... is
+	//   running", and had no way to recover the UID/pipes of the live
+	//   tproxy. GetUidByIdentifier closes that gap.
+	Context("get uid by identifier", func() {
+		It("returns the live UID so ApplyHttpChaos can recover on retry", func() {
+			identifier := RandomeIdentifier()
+
+			// First start: succeeds and registers identifier -> uid.
+			cmd1 := DefaultProcessBuilder("sleep", "5").
+				SetIdentifier(identifier).
+				Build(context.Background())
+			p1, err := m.StartProcess(context.Background(), cmd1)
+			Expect(err).To(BeNil())
+
+			// Look up by identifier -- the regression: must return p1's UID
+			// and not be empty (which is what would force createHttpChaos to
+			// re-spawn and trip "is running").
+			uid, ok := m.GetUidByIdentifier(identifier)
+			Expect(ok).To(BeTrue())
+			Expect(uid).To(Equal(p1.Uid))
+
+			// Second start with the same identifier still must fail (the
+			// no-double-spawn invariant), but the caller now has a way to
+			// recover: GetUidByIdentifier still returns the same UID, and
+			// GetPipes on it gives back usable pipes.
+			cmd2 := DefaultProcessBuilder("sleep", "5").
+				SetIdentifier(identifier).
+				Build(context.Background())
+			_, err = m.StartProcess(context.Background(), cmd2)
+			Expect(err).NotTo(BeNil())
+			Expect(strings.Contains(err.Error(), "is running")).To(BeTrue())
+
+			uid2, ok2 := m.GetUidByIdentifier(identifier)
+			Expect(ok2).To(BeTrue())
+			Expect(uid2).To(Equal(uid))
+
+			pipes, ok3 := m.GetPipes(uid2)
+			Expect(ok3).To(BeTrue())
+			Expect(pipes.Stdin).NotTo(BeNil())
+			Expect(pipes.Stdout).NotTo(BeNil())
+
+			// Cleanup so we don't leak the sleep process or its identifier.
+			err = m.KillBackgroundProcess(context.Background(), uid)
+			Expect(err).To(BeNil())
+			WaitProcess(m, p1, time.Second*0)
+		})
+
+		It("returns false for an unknown or already-exited identifier", func() {
+			_, ok := m.GetUidByIdentifier("never-registered-identifier")
+			Expect(ok).To(BeFalse())
+
+			identifier := RandomeIdentifier()
+			cmd := DefaultProcessBuilder("sleep", "0").
+				SetIdentifier(identifier).
+				Build(context.Background())
+			p, err := m.StartProcess(context.Background(), cmd)
+			Expect(err).To(BeNil())
+
+			WaitProcess(m, p, time.Second*3)
+
+			// Once the process has exited, the death-channel goroutine
+			// removes the identifier; lookups must miss instead of returning
+			// a dangling UID.
+			Eventually(func() bool {
+				_, ok := m.GetUidByIdentifier(identifier)
+				return ok
+			}, time.Second*3, time.Millisecond*100).Should(BeFalse())
+		})
+	})
 })
