@@ -44,16 +44,34 @@ type stdioTransport struct {
 	pipes  bpm.Pipes
 }
 
+// stdioMu returns the per-uid mutex that serializes RoundTrip writes/reads on
+// the same tproxy stdio. The mutex is created on first access and shared via
+// the daemon-scoped sync.Map (DaemonServer.tproxyLocker), so all
+// stdioTransport instances built for the same uid block on the same lock.
+func (t *stdioTransport) stdioMu() *sync.Mutex {
+	mu, _ := t.locker.LoadOrStore(t.uid, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
+
 func (t *stdioTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
-	if _, loaded := t.locker.LoadOrStore(t.uid, true); loaded {
-		return &http.Response{
-			StatusCode: http.StatusLocked,
-			Status:     http.StatusText(http.StatusLocked),
-			Body:       io.NopCloser(bytes.NewBufferString("")),
-			Request:    req,
-		}, nil
-	}
-	defer t.locker.Delete(t.uid)
+	// Serialize concurrent reconciles for the same tproxy.
+	//
+	// Multiple controller-manager replicas (and the same controller's own
+	// reconcile loop firing on resource updates) can call ApplyHttpChaos
+	// concurrently for the same pod. The tproxy stdio is a single bidirectional
+	// pipe -- two callers writing requests at the same time would interleave
+	// bytes mid-frame and corrupt both responses. The original implementation
+	// fast-failed concurrent callers with 423 Locked; the controller then
+	// surfaced that as "Apply failed" and overwrote the previous reconcile's
+	// success in PodHttpChaos.Status, leaving injectedCount stuck at 0 even
+	// though the chaos was actually applied. Block on a per-uid mutex instead;
+	// every caller writes its own request, reads its own response, and returns
+	// 200. The mutex is allocated on first access via LoadOrStore so concurrent
+	// allocations don't race.
+	mu := t.stdioMu()
+	mu.Lock()
+	defer mu.Unlock()
+
 	if t.pipes.Stdin == nil {
 		return nil, errors.New("fail to get stdin of process")
 	}

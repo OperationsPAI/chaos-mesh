@@ -17,17 +17,21 @@ package chaosdaemon
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/chaos-mesh/chaos-mesh/pkg/bpm"
 	"github.com/chaos-mesh/chaos-mesh/pkg/chaosdaemon/crclients"
 	"github.com/chaos-mesh/chaos-mesh/pkg/chaosdaemon/crclients/test"
 	"github.com/chaos-mesh/chaos-mesh/pkg/chaosdaemon/pb"
@@ -123,6 +127,93 @@ var _ = Describe("http chaos server", func() {
 
 			// Cleanup: kill the fake tproxy so the suite exits.
 			Expect(s.backgroundProcessManager.KillBackgroundProcess(context.TODO(), resp1.InstanceUid)).To(Succeed())
+		})
+	})
+
+	// Regression test for the concurrent-RoundTrip 423 bug:
+	//
+	//   Multiple controller-manager replicas (and the same controller's
+	//   reconcile loop firing on resource updates) call ApplyHttpChaos
+	//   concurrently for the same pod. The tproxy stdio is one bidirectional
+	//   pipe; the original code fast-failed concurrent callers with
+	//   StatusLocked (423), which the controller surfaced as
+	//   "Apply failed: status(423)" and used to overwrite the previous
+	//   reconcile's success in PodHttpChaos.Status. Net effect: chaos was
+	//   applied but injectedCount stayed at 0. The fix serializes concurrent
+	//   RoundTrip on a per-uid mutex; every caller eventually writes its own
+	//   request, gets its own 200 response, and surfaces success.
+	Context("RoundTrip concurrency on the same tproxy stdio (regression)", func() {
+		It("serializes concurrent calls and returns 200 for both, never 423", func() {
+			// Synthetic tproxy: one goroutine reads requests off the
+			// stdin-pipe and writes 200 responses to the stdout-pipe.
+			stdinR, stdinW := io.Pipe()
+			stdoutR, stdoutW := io.Pipe()
+
+			// fake tproxy: serve one HTTP request per loop iteration.
+			tproxyDone := make(chan struct{})
+			go func() {
+				defer close(tproxyDone)
+				br := bufio.NewReader(stdinR)
+				for {
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						return
+					}
+					_, _ = io.Copy(io.Discard, req.Body)
+					_ = req.Body.Close()
+					_, _ = fmt.Fprint(stdoutW, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+				}
+			}()
+
+			locker := &sync.Map{}
+			transport := &stdioTransport{
+				uid:    "regression-uid",
+				locker: locker,
+				pipes:  bpm.Pipes{Stdin: stdinW, Stdout: stdoutR},
+			}
+
+			// Drive N concurrent RoundTrips against the same transport.
+			// Without the fix every goroutine after the first one would
+			// observe locker.LoadOrStore(uid, true) -> loaded==true and
+			// return 423; with the fix the per-uid mutex serializes them.
+			const concurrency = 16
+			var wg sync.WaitGroup
+			statuses := make([]int, concurrency)
+			errs := make([]error, concurrency)
+			for i := 0; i < concurrency; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					req, err := http.NewRequest(http.MethodPut, "/", bytes.NewReader([]byte("{}")))
+					if err != nil {
+						errs[i] = err
+						return
+					}
+					resp, err := transport.RoundTrip(req)
+					if err != nil {
+						errs[i] = err
+						return
+					}
+					statuses[i] = resp.StatusCode
+					_ = resp.Body.Close()
+				}(i)
+			}
+
+			done := make(chan struct{})
+			go func() { wg.Wait(); close(done) }()
+			Eventually(done, 5*time.Second).Should(BeClosed(),
+				"all concurrent RoundTrip calls must drain; if any deadlocked the lock implementation is wrong")
+
+			for i := 0; i < concurrency; i++ {
+				Expect(errs[i]).To(BeNil(), "RoundTrip #%d returned error", i)
+				Expect(statuses[i]).To(Equal(http.StatusOK),
+					"RoundTrip #%d returned %d; concurrent reconciles must not see 423", i, statuses[i])
+			}
+
+			// Tear down the fake tproxy.
+			stdinW.Close()
+			stdoutW.Close()
+			<-tproxyDone
 		})
 	})
 })
