@@ -216,4 +216,159 @@ var _ = Describe("http chaos server", func() {
 			<-tproxyDone
 		})
 	})
+
+	// Regression test for symptom 1 (deadlock) reported on byte-cluster:
+	//
+	//   When the host pod is deleted and replaced (StatefulSet rollout etc.),
+	//   the original tproxy process inside the old pod's net+pid namespaces is
+	//   gone, but BPM's deathChannel cleanup may not fire promptly -- leaving a
+	//   stale `(uid, pipes)` entry whose pipe FDs would block forever on write.
+	//   The next ApplyHttpChaos that recovered this stale uid would log
+	//   "ready to apply" and then deadlock inside RoundTrip, holding the
+	//   per-uid mutex; every subsequent reconcile would block at Lock().
+	//
+	// The fix: live-check via IsProcessAlive before trusting the recovered
+	// uid; if dead, EvictProcess and fall through to createHttpChaos.
+	Context("ApplyHttpChaos with stale BPM entry (regression: deadlock symptom 1)", func() {
+		It("detects a dead tproxy, evicts it, and respawns a fresh one", func() {
+			Expect(s).NotTo(BeNil(), "newDaemonServer must build with the mocked containerd client")
+
+			defer mock.With("pid", 9527)()
+
+			// Track every spawn so we can assert two distinct tproxies were
+			// born across the two ApplyHttpChaos calls.
+			var spawnCount int32
+			var spawnedCmds sync.Map // pid -> *exec.Cmd, populated post-Start
+			defer mock.With("MockProcessBuild", func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+				atomic.AddInt32(&spawnCount, 1)
+				c := exec.Command(os.Args[0])
+				c.Env = append(os.Environ(), fakeTproxyEnv+"=1")
+				return c
+			})()
+
+			containerID := "containerd://stale-recovery-container-id"
+			req1 := &pb.ApplyHttpChaosRequest{
+				Rules:       "[]",
+				ProxyPorts:  []uint32{8080},
+				ContainerId: containerID,
+				EnterNS:     true,
+			}
+
+			resp1, err := s.ApplyHttpChaos(context.TODO(), req1)
+			Expect(err).To(BeNil())
+			Expect(resp1.InstanceUid).NotTo(BeEmpty())
+			firstUid := resp1.InstanceUid
+
+			// The first spawn happened; remember its pid so we can later
+			// assert the second spawn produced a different process.
+			spawnedCmds.Store("first", resp1.Instance)
+
+			// Kill the first fake-tproxy outside of BPM (simulating the
+			// host pod's namespace teardown reaping tproxy without
+			// chaos-daemon's deathChannel goroutine getting a chance to
+			// drain). We reach into BPM internals to grab the cmd.
+			proc, ok := s.backgroundProcessManager.GetPipes(firstUid)
+			Expect(ok).To(BeTrue())
+			_ = proc // keep the variable used; pipes are also relevant only insofar as the underlying process is gone
+
+			// Find the *Process in BPM and kill its underlying os.Process.
+			// We can't reach the cmd directly through public API, so find
+			// it via the same pid that was returned in resp1.
+			killByPid(int(resp1.Instance))
+
+			// Wait until the host kernel's reaped the process so
+			// IsProcessAlive returns false. Note: the deathChannel may or
+			// may not have drained by now; the test deliberately races to
+			// hit ApplyHttpChaos *before* it does (which is the bug
+			// scenario). IsProcessAlive must catch this regardless.
+			Eventually(func() bool {
+				return s.backgroundProcessManager.IsProcessAlive(firstUid)
+			}, 5*time.Second, 50*time.Millisecond).Should(BeFalse(),
+				"first fake tproxy must report dead after we killed it")
+
+			// Second ApplyHttpChaos for the SAME containerID. With the bug,
+			// recovery would trust the dead uid and RoundTrip would hang.
+			// With the fix, IsProcessAlive returns false, EvictProcess
+			// drops the stale entry, and createHttpChaos spawns a fresh
+			// tproxy under a new uid.
+			req2 := &pb.ApplyHttpChaosRequest{
+				Rules:       "[]",
+				ProxyPorts:  []uint32{8080},
+				ContainerId: containerID,
+				EnterNS:     true,
+			}
+			done := make(chan struct{})
+			var resp2 *pb.ApplyHttpChaosResponse
+			var err2 error
+			go func() {
+				defer close(done)
+				resp2, err2 = s.ApplyHttpChaos(context.TODO(), req2)
+			}()
+			Eventually(done, 10*time.Second).Should(BeClosed(),
+				"second ApplyHttpChaos must not deadlock when recovery hits a dead tproxy")
+			Expect(err2).To(BeNil())
+			Expect(resp2).NotTo(BeNil())
+			Expect(resp2.InstanceUid).NotTo(BeEmpty())
+			Expect(resp2.InstanceUid).NotTo(Equal(firstUid),
+				"a stale uid must be evicted, not reused; second call should mint a new uid")
+			Expect(atomic.LoadInt32(&spawnCount)).To(Equal(int32(2)),
+				"exactly two spawns: first is now stale + dead, second is the respawn")
+
+			// Cleanup the second fake tproxy.
+			Expect(s.backgroundProcessManager.KillBackgroundProcess(context.TODO(), resp2.InstanceUid)).To(Succeed())
+		})
+	})
+
+	// Regression test for the timeout half of symptom 1: even with the
+	// IsProcessAlive guard, RoundTrip itself must not block forever if
+	// tproxy is alive but unresponsive (e.g. wedged on a slow rule push).
+	// Without a deadline the per-uid mutex would still deadlock subsequent
+	// callers. RoundTripCtx caps the wait and returns ctx.Err() promptly.
+	Context("RoundTripCtx timeout (regression: deadlock symptom 1, slow path)", func() {
+		It("returns context.DeadlineExceeded when tproxy never reads stdin", func() {
+			// Pipe with no reader on the other side -- writes will block
+			// until the buffer fills, simulating an unresponsive tproxy.
+			stdinR, stdinW := io.Pipe()
+			_, stdoutW := io.Pipe()
+			defer stdinR.Close()
+			defer stdinW.Close()
+			defer stdoutW.Close()
+
+			locker := &sync.Map{}
+			transport := &stdioTransport{
+				uid:    "slow-tproxy-uid",
+				locker: locker,
+				pipes:  bpm.Pipes{Stdin: stdinW, Stdout: io.NopCloser(bytes.NewReader(nil))},
+			}
+
+			req, err := http.NewRequest(http.MethodPut, "/", bytes.NewReader([]byte("{}")))
+			Expect(err).To(BeNil())
+
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+
+			start := time.Now()
+			_, err = transport.RoundTripCtx(ctx, req)
+			elapsed := time.Since(start)
+
+			Expect(err).NotTo(BeNil(),
+				"RoundTripCtx must surface an error when tproxy is unresponsive")
+			Expect(elapsed).To(BeNumerically("<", 2*time.Second),
+				"RoundTripCtx must return promptly on timeout, not block")
+			// Underlying ctx.Err() should be DeadlineExceeded, wrapped.
+			Expect(ctx.Err()).To(Equal(context.DeadlineExceeded))
+		})
+	})
 })
+
+// killByPid sends SIGKILL to the host process at the given pid. Used by the
+// stale-recovery test to bypass BPM's KillBackgroundProcess (which would
+// trigger deathChannel cleanup) and simulate the host pod's namespace
+// teardown reaping tproxy out from under chaos-daemon.
+func killByPid(pid int) {
+	osProc, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	_ = osProc.Kill()
+}

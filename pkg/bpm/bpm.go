@@ -363,6 +363,65 @@ func (m *BackgroundProcessManager) GetUidByIdentifier(identifier string) (string
 	return uid, true
 }
 
+// IsProcessAlive returns true if BPM has a tracked process with this UID and
+// the underlying OS process is still running with the original create-time
+// (defending against PID reuse). False is returned for any of:
+//   - the UID is not registered (already recycled)
+//   - the OS process at the cached PID has exited
+//   - the OS process at the cached PID has a different create-time
+//     (PID was recycled by a different unrelated process)
+//
+// Callers such as ApplyHttpChaos use this to decide whether a "recovered"
+// uid actually points at a live tproxy or a stale BPM entry whose pipes
+// would block forever on write.
+func (m *BackgroundProcessManager) IsProcessAlive(uid string) bool {
+	proc, ok := m.getProc(uid)
+	if !ok {
+		return false
+	}
+
+	osProc, err := process.NewProcess(int32(proc.Pair.Pid))
+	if err != nil {
+		// process.NewProcess returns an error when /proc/<pid> is gone
+		return false
+	}
+
+	ct, err := osProc.CreateTime()
+	if err != nil {
+		// Process exists but we can't read its stat; treat as dead to be safe.
+		return false
+	}
+
+	// Defend against PID reuse: a different process may have grabbed the same
+	// PID after the original tproxy died. The create-time has microsecond-ish
+	// resolution and is captured at StartProcess time, so it's a reliable
+	// generation marker.
+	return ct == proc.Pair.CreateTime
+}
+
+// EvictProcess unregisters a process from BPM as if its host process had
+// exited. Use this when IsProcessAlive returned false: the death-channel
+// cleanup never fired (e.g. because cmd.Wait was blocked, or because the host
+// chaos-daemon restarted with stale state) but the OS process is gone.
+// The cleanup mirrors the deathChannel goroutine: deletes from processes,
+// pidPairToUid, and identifiers, then cancels the per-process context.
+//
+// This is a no-op if the UID is not currently registered.
+func (m *BackgroundProcessManager) EvictProcess(uid string) {
+	v, loaded := m.processes.LoadAndDelete(uid)
+	if !loaded {
+		return
+	}
+	proc := v.(*Process)
+	m.pidPairToUid.Delete(proc.Pair)
+	if proc.Cmd.Identifier != nil {
+		m.identifiers.Delete(*proc.Cmd.Identifier)
+	}
+	if proc.stopped != nil {
+		proc.stopped()
+	}
+}
+
 func (m *BackgroundProcessManager) getLoggerFromContext(ctx context.Context) logr.Logger {
 	return log.EnrichLoggerWithContext(ctx, m.rootLogger)
 }

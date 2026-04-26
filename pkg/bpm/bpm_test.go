@@ -261,4 +261,100 @@ var _ = Describe("background process manager", func() {
 			}, time.Second*3, time.Millisecond*100).Should(BeFalse())
 		})
 	})
+
+	// IsProcessAlive + EvictProcess back the "stale recovery" defense in
+	// ApplyHttpChaos: when the host pod is deleted out from under us the
+	// death-channel cleanup may not fire promptly, leaving a stale BPM entry
+	// whose pipe FDs would block forever on write. Callers use
+	// IsProcessAlive to decide whether to trust a recovered uid, and
+	// EvictProcess to drop a stale entry without sending SIGTERM (since the
+	// process is already gone).
+	Context("liveness check and eviction", func() {
+		It("IsProcessAlive returns true while the process runs and false after it exits", func() {
+			cmd := DefaultProcessBuilder("sleep", "0.2").Build(context.Background())
+			p, err := m.StartProcess(context.Background(), cmd)
+			Expect(err).To(BeNil())
+
+			// While alive: must report alive.
+			Expect(m.IsProcessAlive(p.Uid)).To(BeTrue())
+
+			// After exit: deathChannel will eventually remove the entry, at
+			// which point IsProcessAlive returns false because the uid is
+			// no longer tracked.
+			Eventually(func() bool {
+				return m.IsProcessAlive(p.Uid)
+			}, time.Second*3, time.Millisecond*50).Should(BeFalse())
+		})
+
+		It("IsProcessAlive returns false after the host process is killed bypassing BPM", func() {
+			// Spawn a sleep we can SIGKILL without going through BPM, to
+			// simulate the host pod's namespace teardown reaping tproxy
+			// before the deathChannel goroutine drains.
+			cmd := DefaultProcessBuilder("sleep", "30").Build(context.Background())
+			p, err := m.StartProcess(context.Background(), cmd)
+			Expect(err).To(BeNil())
+
+			Expect(m.IsProcessAlive(p.Uid)).To(BeTrue())
+
+			// Reach around BPM and SIGKILL the process directly.
+			Expect(p.Cmd.Process.Kill()).To(Succeed())
+
+			// IsProcessAlive must report false even though BPM may not have
+			// observed the death yet (the deathChannel goroutine drains
+			// asynchronously). This is exactly the ApplyHttpChaos
+			// stale-recovery scenario.
+			Eventually(func() bool {
+				return m.IsProcessAlive(p.Uid)
+			}, time.Second*3, time.Millisecond*50).Should(BeFalse())
+		})
+
+		It("IsProcessAlive returns false for an unknown uid", func() {
+			Expect(m.IsProcessAlive("never-registered-uid")).To(BeFalse())
+		})
+
+		It("EvictProcess unregisters the uid + identifier so a fresh start can re-register", func() {
+			identifier := RandomeIdentifier()
+			cmd := DefaultProcessBuilder("sleep", "30").
+				SetIdentifier(identifier).
+				Build(context.Background())
+			p, err := m.StartProcess(context.Background(), cmd)
+			Expect(err).To(BeNil())
+
+			// Sanity: identifier is in use, so a second start must fail.
+			cmd2 := DefaultProcessBuilder("sleep", "1").
+				SetIdentifier(identifier).
+				Build(context.Background())
+			_, err = m.StartProcess(context.Background(), cmd2)
+			Expect(err).NotTo(BeNil())
+			Expect(strings.Contains(err.Error(), "is running")).To(BeTrue())
+
+			// Evict the original (still actually running, but pretend it's
+			// stale). All three internal maps must be cleared.
+			m.EvictProcess(p.Uid)
+
+			_, ok := m.GetUidByIdentifier(identifier)
+			Expect(ok).To(BeFalse())
+			_, ok = m.GetUID(p.Pair)
+			Expect(ok).To(BeFalse())
+			_, ok = m.GetPipes(p.Uid)
+			Expect(ok).To(BeFalse())
+
+			// And a fresh start on the same identifier now succeeds.
+			cmd3 := DefaultProcessBuilder("sleep", "0.2").
+				SetIdentifier(identifier).
+				Build(context.Background())
+			p3, err := m.StartProcess(context.Background(), cmd3)
+			Expect(err).To(BeNil())
+
+			// Cleanup: kill the still-running first process (we evicted its
+			// BPM record but the OS process is alive).
+			Expect(p.Cmd.Process.Kill()).To(Succeed())
+			WaitProcess(m, p3, time.Second*3)
+		})
+
+		It("EvictProcess on an unknown uid is a no-op", func() {
+			// Must not panic.
+			m.EvictProcess("never-registered-uid")
+		})
+	})
 })

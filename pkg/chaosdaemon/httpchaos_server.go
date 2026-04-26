@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -36,6 +37,15 @@ import (
 const (
 	tproxyBin = "/usr/local/bin/tproxy"
 	pathEnv   = "PATH"
+
+	// httpChaosRoundTripTimeout caps a single tproxy stdio request/response
+	// cycle. If the underlying tproxy process is dead or unresponsive, the
+	// stdin write or stdout read can block indefinitely; without a cap the
+	// per-uid mutex in stdioTransport.RoundTrip would never release and every
+	// subsequent reconcile would deadlock at Lock(). The cap is intentionally
+	// shorter than typical gRPC-client deadlines so the caller can return a
+	// clean error and let the controller retry / evict.
+	httpChaosRoundTripTimeout = 5 * time.Second
 )
 
 type stdioTransport struct {
@@ -51,6 +61,39 @@ type stdioTransport struct {
 func (t *stdioTransport) stdioMu() *sync.Mutex {
 	mu, _ := t.locker.LoadOrStore(t.uid, &sync.Mutex{})
 	return mu.(*sync.Mutex)
+}
+
+// RoundTripCtx is the context-aware entry point. It runs RoundTrip in a
+// goroutine, then either returns its result or, if the context fires first,
+// returns a deadline-exceeded error.
+//
+// Why this matters: if the underlying tproxy process has died but BPM still
+// has its pipe FDs (e.g. the host pod was deleted out from under us), a
+// stdin write or stdout read can block forever. Without a deadline the
+// per-uid mutex held by RoundTrip would never release, and every subsequent
+// reconcile would deadlock at Lock() and then time out at the gRPC layer
+// with "context canceled" events on the CR.
+//
+// Note: the spawned goroutine still holds the mutex if its I/O hangs. The
+// caller (ApplyHttpChaos) is responsible for evicting the BPM entry on
+// timeout so subsequent calls re-spawn a fresh tproxy under a fresh uid
+// (and thus a different mutex), instead of queueing behind the dead one.
+func (t *stdioTransport) RoundTripCtx(ctx context.Context, req *http.Request) (*http.Response, error) {
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := t.RoundTrip(req)
+		done <- result{resp: resp, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.resp, r.err
+	case <-ctx.Done():
+		return nil, errors.Wrapf(ctx.Err(), "tproxy stdio roundtrip aborted (uid=%s)", t.uid)
+	}
 }
 
 func (t *stdioTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
@@ -116,8 +159,23 @@ func (s *DaemonServer) ApplyHttpChaos(ctx context.Context, in *pb.ApplyHttpChaos
 	// Look up the live tproxy process directly by its identifier and reuse it.
 	if in.InstanceUid == "" && in.ContainerId != "" {
 		if uid, ok := s.backgroundProcessManager.GetUidByIdentifier(httpChaosIdentifier(in.ContainerId)); ok {
-			log.Info("recovered existing tproxy", "uid", uid, "containerId", in.ContainerId)
-			in.InstanceUid = uid
+			// Live-check before trusting the recovered uid. If the host pod
+			// was deleted and replaced (StatefulSet rollout, eviction, etc.)
+			// the original tproxy is gone but the deathChannel cleanup may
+			// not have fired yet (e.g. cmd.Wait stuck across the namespace
+			// teardown, or the controller hit us before the chan drained).
+			// Trusting a stale uid sends RoundTrip into a dead pipe that
+			// blocks forever, which then deadlocks every subsequent
+			// reconcile via the per-uid mutex.
+			if s.backgroundProcessManager.IsProcessAlive(uid) {
+				log.Info("recovered existing tproxy", "uid", uid, "containerId", in.ContainerId)
+				in.InstanceUid = uid
+			} else {
+				log.Info("stale tproxy entry, evicting and respawning",
+					"uid", uid, "containerId", in.ContainerId)
+				s.backgroundProcessManager.EvictProcess(uid)
+				// fall through to createHttpChaos below
+			}
 		}
 	}
 
@@ -193,8 +251,22 @@ func (s *DaemonServer) applyHttpChaos(ctx context.Context, in *pb.ApplyHttpChaos
 		return nil, errors.Wrap(err, "create http request")
 	}
 
-	resp, err := transport.RoundTrip(req)
+	// Cap the stdio roundtrip with our own deadline. Use the more restrictive
+	// of the caller's gRPC ctx and our internal cap: never block longer than
+	// httpChaosRoundTripTimeout, but exit early if the gRPC client gives up
+	// first. On timeout we evict the BPM entry so the next reconcile starts
+	// fresh -- otherwise the in-flight goroutine pins the per-uid mutex
+	// behind a dead pipe and every subsequent caller deadlocks too.
+	rtCtx, cancel := context.WithTimeout(ctx, httpChaosRoundTripTimeout)
+	defer cancel()
+
+	resp, err := transport.RoundTripCtx(rtCtx, req)
 	if err != nil {
+		if rtCtx.Err() != nil {
+			log.Info("tproxy unresponsive, evicting BPM entry so next reconcile respawns",
+				"uid", in.InstanceUid, "timeout", httpChaosRoundTripTimeout)
+			s.backgroundProcessManager.EvictProcess(in.InstanceUid)
+		}
 		return nil, errors.Wrap(err, "send http request")
 	}
 
