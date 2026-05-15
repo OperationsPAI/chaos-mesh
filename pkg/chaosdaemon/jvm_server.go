@@ -251,24 +251,22 @@ func (s *DaemonServer) InstallRuntimeMutator(ctx context.Context,
 
 	agentPath := fmt.Sprintf("%s/lib/mutator-agent.jar", bytemanHome)
 
-	// Always copy agent JAR to container regardless of EnterNS flag
-	// Ensure byteman lib directory exists in container
-	processBuilder := bpm.DefaultProcessBuilder("sh", "-c", fmt.Sprintf("mkdir -p %s/lib", bytemanHome)).SetContext(ctx).SetNS(pid, bpm.MountNS)
-	output, err := processBuilder.Build(ctx).CombinedOutput()
-	if err != nil {
-		log.Error(err, "failed to create byteman directory in container", "output", string(output))
-		return &pb.RuntimeMutatorResponse{Success: false, Message: string(output)}, err
+	// Always copy agent JAR to container regardless of EnterNS flag.
+	// Operate on the container rootfs via /proc/<pid>/root so this works on
+	// distroless target images (same reason as InstallJVMRules).
+	if err := mkdirInContainer(pid, fmt.Sprintf("%s/lib", bytemanHome)); err != nil {
+		log.Error(err, "failed to create byteman directory in container")
+		return &pb.RuntimeMutatorResponse{Success: false, Message: err.Error()}, err
 	}
 
 	// Copy jar file
 	source := agentPath
 	dest := agentPath
-	output, err = copyFileAcrossNS(ctx, source, dest, pid)
-	if err != nil {
-		log.Error(err, "failed to copy mutator-agent.jar", "output", string(output))
-		return &pb.RuntimeMutatorResponse{Success: false, Message: string(output)}, err
+	if err := copyFileAcrossNS(ctx, source, dest, pid); err != nil {
+		log.Error(err, "failed to copy mutator-agent.jar")
+		return &pb.RuntimeMutatorResponse{Success: false, Message: err.Error()}, err
 	}
-	log.Info("copied mutator-agent.jar to container", "output", string(output))
+	log.Info("copied mutator-agent.jar to container")
 
 	// Build JVM arguments
 	jvmArgs := fmt.Sprintf("mutator_action=%s,mutator_class=%s,mutator_method=%s",
@@ -287,12 +285,12 @@ func (s *DaemonServer) InstallRuntimeMutator(ctx context.Context,
 	// Use jattach to load the agent
 	jattachCmd := fmt.Sprintf("jattach %d load instrument false '%s=%s'", javaPid, agentPath, jvmArgs)
 
-	processBuilder = bpm.DefaultProcessBuilder("sh", "-c", jattachCmd).SetContext(ctx)
+	processBuilder := bpm.DefaultProcessBuilder("sh", "-c", jattachCmd).SetContext(ctx)
 	if req.EnterNS {
 		processBuilder = processBuilder.SetNS(pid, bpm.MountNS)
 	}
 
-	output, err = processBuilder.Build(ctx).CombinedOutput()
+	output, err := processBuilder.Build(ctx).CombinedOutput()
 	if err != nil {
 		log.Error(err, "failed to install runtime mutator", "output", string(output))
 		return &pb.RuntimeMutatorResponse{Success: false, Message: string(output)}, err
