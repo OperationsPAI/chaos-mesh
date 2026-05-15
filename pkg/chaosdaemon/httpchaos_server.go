@@ -178,7 +178,11 @@ func (s *DaemonServer) createHttpChaos(ctx context.Context, in *pb.ApplyHttpChao
 	if err != nil {
 		return errors.Wrapf(err, "get PID of container(%s)", in.ContainerId)
 	}
-	processBuilder := bpm.DefaultProcessBuilder(tproxyBin, "-i", "-vv").
+	args := []string{"-i", "-vv"}
+	if s.TproxyBridgeless {
+		args = append(args, "--bridgeless")
+	}
+	processBuilder := bpm.DefaultProcessBuilder(tproxyBin, args...).
 		EnableLocalMnt().
 		SetIdentifier(fmt.Sprintf("tproxy-%s", in.ContainerId)).
 		SetEnv(pathEnv, os.Getenv(pathEnv))

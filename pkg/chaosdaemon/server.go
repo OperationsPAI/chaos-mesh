@@ -56,6 +56,15 @@ type Config struct {
 	CrClientConfig *crclients.CrClientConfig
 	Profiling      bool
 
+	// TproxyBridgeless makes ApplyHttpChaos spawn the tproxy binary with the
+	// `--bridgeless` flag. Required on IPVLAN-based CNIs (Cilium IPVLAN,
+	// Cello/VolcEngine VPC-CNI) where tproxy's bridge mode dies trying to
+	// enslave the pod's eth0 to a bridge. Inbound chaos only — outbound
+	// (`direction: from`) is not interceptable on these CNIs because the
+	// BPF datapath bypasses iptables on egress. See
+	// chaos-tproxy/docs/bridgeless-mode.md.
+	TproxyBridgeless bool
+
 	tlsConfig
 }
 
@@ -87,6 +96,10 @@ type DaemonServer struct {
 
 	IPSetLocker     *locker.Locker
 	timeChaosServer TimeChaosServer
+
+	// TproxyBridgeless, when true, makes ApplyHttpChaos spawn the tproxy
+	// binary with `--bridgeless`. See Config.TproxyBridgeless.
+	TproxyBridgeless bool
 }
 
 func (s *DaemonServer) getLoggerFromContext(ctx context.Context) logr.Logger {
@@ -212,6 +225,7 @@ func BuildServer(conf *Config, reg RegisterGatherer, log logr.Logger) (*Server, 
 	if err != nil {
 		return nil, errors.Wrap(err, "create daemon server")
 	}
+	server.daemonServer.TproxyBridgeless = conf.TproxyBridgeless
 
 	server.httpServer = newHTTPServerBuilder().Addr(conf.HttpAddr()).Metrics(reg).Profiling(conf.Profiling).Build()
 	server.grpcServer, err = newGRPCServer(server.daemonServer, reg, conf.tlsConfig)

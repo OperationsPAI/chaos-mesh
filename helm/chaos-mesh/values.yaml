@@ -201,6 +201,14 @@ chaosDaemon:
   serviceAccountAnnotations: {}
   # Specify PodSecurityPolicy(psp) on chaos-daemon pods
   podSecurityPolicy: false
+  # tproxyBridgeless makes chaos-daemon spawn the tproxy binary with
+  # `--bridgeless`. Set this to true on clusters whose CNI uses IPVLAN child
+  # interfaces (Cilium IPVLAN, Cello/VolcEngine VPC-CNI), where tproxy's
+  # default bridge mode is rejected by the kernel. Inbound HTTP chaos only —
+  # outbound (`direction: from`) is not interceptable when the BPF datapath
+  # bypasses iptables on egress.
+  tproxyBridgeless: false
+
   # runtime specifies which container runtime to use. Currently
   # we only supports docker, containerd and CRI-O.
   runtime: containerd

@@ -51,8 +51,16 @@ func init() {
 	flag.StringVar(&conf.Cert, "cert", "", "certificate of grpc server")
 	flag.StringVar(&conf.Key, "key", "", "key of grpc server")
 	flag.BoolVar(&conf.Profiling, "pprof", false, "enable pprof")
+	flag.BoolVar(&conf.TproxyBridgeless, "tproxy-bridgeless", false,
+		"spawn the tproxy binary with --bridgeless. Required for IPVLAN-based "+
+			"CNIs (Cilium IPVLAN, Cello). Inbound HTTP chaos only. Also "+
+			"toggleable via env CHAOS_TPROXY_BRIDGELESS=true.")
 
 	flag.Parse()
+
+	if !conf.TproxyBridgeless && os.Getenv("CHAOS_TPROXY_BRIDGELESS") == "true" {
+		conf.TproxyBridgeless = true
+	}
 }
 
 func main() {

@@ -79,6 +79,9 @@ spec:
           {{- if .Values.enableProfiling }}
             - --pprof
           {{- end }}
+          {{- if .Values.chaosDaemon.tproxyBridgeless }}
+            - --tproxy-bridgeless
+          {{- end }}
           {{- if .Values.chaosDaemon.mtls.enabled }}
             - --ca
             - /etc/chaos-daemon/cert/ca.crt
