@@ -16,8 +16,11 @@ RUN mkdir -p /tmp/bin && \
     mv /usr/local/byteman-chaos-mesh-download-v4.0.24-0.12 /tmp/byteman && \
     rm /usr/local/byteman.tar.gz
 
-# Copy java-runtime-mutator agent jar from local build
-COPY mutator-agent.jar /tmp/byteman/lib/mutator-agent.jar
+# Download java-runtime-mutator agent jar (v1.1.0: telemetry leak fix)
+RUN curl -L https://github.com/OperationsPAI/java-runtime-mutator/releases/download/v1.1.0/mutator-agent-1.1.0.jar -o /tmp/byteman/lib/mutator-agent.jar
+
+# Overlay patched byteman-helper (v0.12.1: PreparedStatement SQL extraction fix, upstream #4454)
+RUN curl -L https://github.com/OperationsPAI/byteman-helper/releases/download/v0.12.1/byteman-helper-0.12.jar -o /tmp/byteman/lib/byteman-helper.jar
 
 # toda doesn't support arm64 yet
 RUN curl -L https://github.com/chaos-mesh/toda/releases/download/v0.2.4/toda-linux-amd64.tar.gz | tar xz -C /tmp/bin
@@ -35,8 +38,14 @@ RUN case "$TARGET_PLATFORM" in \
     *) echo >&2 "error: unsupported architecture '$TARGET_PLATFORM'"; exit 1 ;; \
     esac; \
     curl -L https://github.com/chaos-mesh/nsexec/releases/download/v0.1.6/nsexec-$NSEXEC_ARCH-unknown-linux-gnu.tar.gz | tar xz -C /tmp/bin; \
-    curl -L https://github.com/chaos-mesh/chaos-tproxy/releases/download/v0.5.3/tproxy-$NSEXEC_ARCH.tar.gz | tar xz -C /tmp/bin; \
     curl -L https://github.com/chaos-mesh/memStress/releases/download/v0.3/memStress_v0.3-$NSEXEC_ARCH-linux-gnu.tar.gz | tar xz -C /tmp/bin
+
+# tproxy is built locally from the OperationsPAI/chaos-tproxy fork carrying
+# bridgeless mode support — until that fork cuts a tagged release whose
+# release.yaml workflow runs on the fork's runners. See
+# docs/bridgeless-mode.md (in the chaos-tproxy fork) for the why.
+COPY tproxy /tmp/bin/tproxy
+RUN chmod +x /tmp/bin/tproxy
 
 # ---
 FROM debian:bookworm-slim
