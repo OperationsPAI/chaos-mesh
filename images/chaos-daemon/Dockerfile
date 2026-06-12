@@ -19,8 +19,9 @@ RUN mkdir -p /tmp/bin && \
 # Download java-runtime-mutator agent jar (v1.1.0: telemetry leak fix)
 RUN curl -L https://github.com/OperationsPAI/java-runtime-mutator/releases/download/v1.1.0/mutator-agent-1.1.0.jar -o /tmp/byteman/lib/mutator-agent.jar
 
-# Overlay patched byteman-helper (v0.12.1: PreparedStatement SQL extraction fix, upstream #4454)
-RUN curl -L https://github.com/OperationsPAI/byteman-helper/releases/download/v0.12.1/byteman-helper-0.12.jar -o /tmp/byteman/lib/byteman-helper.jar
+# Overlay patched byteman-helper (v0.12.2: PreparedStatement SQL extraction (#4454)
+# + match unqualified ORM tables / value-equality in matchDBTable)
+RUN curl -L https://github.com/OperationsPAI/byteman-helper/releases/download/v0.12.2/byteman-helper-0.12.jar -o /tmp/byteman/lib/byteman-helper.jar
 
 # toda doesn't support arm64 yet
 RUN curl -L https://github.com/chaos-mesh/toda/releases/download/v0.2.4/toda-linux-amd64.tar.gz | tar xz -C /tmp/bin
