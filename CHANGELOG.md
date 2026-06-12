@@ -10,7 +10,7 @@ For more information and how-to, see [RFC: Keep A Changelog](https://github.com/
 
 ### Added
 
-- Nothing
+- Add MySQL Connector/J 9.x support for JVMChaos MySQL action [#4454](https://github.com/chaos-mesh/chaos-mesh/issues/4454)
 
 ### Changed
 
@@ -26,7 +26,7 @@ For more information and how-to, see [RFC: Keep A Changelog](https://github.com/
 
 ### Fixed
 
-- Nothing
+- Fix JVMChaos MySQL action never firing on PreparedStatement execution paths (null SQL causes silent NPE) [#4454](https://github.com/chaos-mesh/chaos-mesh/issues/4454)
 
 ### Security
 
