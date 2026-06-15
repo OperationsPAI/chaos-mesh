@@ -210,7 +210,11 @@ func (m *BackgroundProcessManager) recycle(uid string) {
 func (m *BackgroundProcessManager) StartProcess(ctx context.Context, cmd *ManagedCommand) (*Process, error) {
 	log := m.getLoggerFromContext(ctx)
 	if cmd.Identifier != nil {
-		_, loaded := m.identifiers.LoadOrStore(*cmd.Identifier, true)
+		// Reserve the identifier slot with a sentinel empty string so that any
+		// concurrent StartProcess call with the same identifier still bails out,
+		// but successful starts will overwrite the slot with the real UID below —
+		// enabling idempotent reuse via GetUidByIdentifier.
+		_, loaded := m.identifiers.LoadOrStore(*cmd.Identifier, "")
 		if loaded {
 			return nil, errors.Errorf("process with identifier %s is running", *cmd.Identifier)
 		}
@@ -218,11 +222,20 @@ func (m *BackgroundProcessManager) StartProcess(ctx context.Context, cmd *Manage
 
 	process, err := startProcess(cmd)
 	if err != nil {
+		// roll back the identifier reservation so the next call can retry
+		if cmd.Identifier != nil {
+			m.identifiers.Delete(*cmd.Identifier)
+		}
 		return nil, err
 	}
 
 	m.processes.Store(process.Uid, process)
 	m.pidPairToUid.Store(process.Pair, process.Uid)
+	if cmd.Identifier != nil {
+		// Now that we have a UID, replace the sentinel with the real UID so
+		// callers can recover the running process (and its pipes) on retry.
+		m.identifiers.Store(*cmd.Identifier, process.Uid)
+	}
 	// end
 
 	if m.metricsCollector != nil {
@@ -324,6 +337,89 @@ func (m *BackgroundProcessManager) GetIdentifiers() []string {
 	})
 
 	return identifiers
+}
+
+// GetUidByIdentifier returns the UID of the running process registered under
+// the given identifier. The second return value is false when no process with
+// that identifier is currently tracked, or when the slot is still in the
+// reserved-but-not-started state (sentinel empty string). This enables callers
+// such as ApplyHttpChaos to recover the existing process on retry instead of
+// failing with "process with identifier ... is running".
+func (m *BackgroundProcessManager) GetUidByIdentifier(identifier string) (string, bool) {
+	v, loaded := m.identifiers.Load(identifier)
+	if !loaded {
+		return "", false
+	}
+	uid, ok := v.(string)
+	if !ok || uid == "" {
+		return "", false
+	}
+	// Make sure the process is actually still tracked. The deathChannel goroutine
+	// deletes the identifier on process exit, but we double-check to guard
+	// against any caller having raced with recycle.
+	if _, ok := m.processes.Load(uid); !ok {
+		return "", false
+	}
+	return uid, true
+}
+
+// IsProcessAlive returns true if BPM has a tracked process with this UID and
+// the underlying OS process is still running with the original create-time
+// (defending against PID reuse). False is returned for any of:
+//   - the UID is not registered (already recycled)
+//   - the OS process at the cached PID has exited
+//   - the OS process at the cached PID has a different create-time
+//     (PID was recycled by a different unrelated process)
+//
+// Callers such as ApplyHttpChaos use this to decide whether a "recovered"
+// uid actually points at a live tproxy or a stale BPM entry whose pipes
+// would block forever on write.
+func (m *BackgroundProcessManager) IsProcessAlive(uid string) bool {
+	proc, ok := m.getProc(uid)
+	if !ok {
+		return false
+	}
+
+	osProc, err := process.NewProcess(int32(proc.Pair.Pid))
+	if err != nil {
+		// process.NewProcess returns an error when /proc/<pid> is gone
+		return false
+	}
+
+	ct, err := osProc.CreateTime()
+	if err != nil {
+		// Process exists but we can't read its stat; treat as dead to be safe.
+		return false
+	}
+
+	// Defend against PID reuse: a different process may have grabbed the same
+	// PID after the original tproxy died. The create-time has microsecond-ish
+	// resolution and is captured at StartProcess time, so it's a reliable
+	// generation marker.
+	return ct == proc.Pair.CreateTime
+}
+
+// EvictProcess unregisters a process from BPM as if its host process had
+// exited. Use this when IsProcessAlive returned false: the death-channel
+// cleanup never fired (e.g. because cmd.Wait was blocked, or because the host
+// chaos-daemon restarted with stale state) but the OS process is gone.
+// The cleanup mirrors the deathChannel goroutine: deletes from processes,
+// pidPairToUid, and identifiers, then cancels the per-process context.
+//
+// This is a no-op if the UID is not currently registered.
+func (m *BackgroundProcessManager) EvictProcess(uid string) {
+	v, loaded := m.processes.LoadAndDelete(uid)
+	if !loaded {
+		return
+	}
+	proc := v.(*Process)
+	m.pidPairToUid.Delete(proc.Pair)
+	if proc.Cmd.Identifier != nil {
+		m.identifiers.Delete(*proc.Cmd.Identifier)
+	}
+	if proc.stopped != nil {
+		proc.stopped()
+	}
 }
 
 func (m *BackgroundProcessManager) getLoggerFromContext(ctx context.Context) logr.Logger {
